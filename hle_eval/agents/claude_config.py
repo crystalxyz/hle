@@ -13,8 +13,8 @@ class ClaudeConfig:
         self,
         api_key: str | None = None,
         base_url: str | None = None,
-        model: str = "sonnet",
-        timeout: float = 600.0,
+        model: str = "haiku",
+        timeout: float = 1200.0,
     ):
         """
         Initialize Claude Code configuration.
@@ -23,7 +23,7 @@ class ClaudeConfig:
             api_key: Anthropic API key. If None, reads from ANTHROPIC_API_KEY env var
             base_url: Anthropic base URL. If None, reads from ANTHROPIC_BASE_URL env var
             model: Model name to use (default: sonnet)
-            timeout: Timeout in seconds for CLI execution (default: 600)
+            timeout: Timeout in seconds for CLI execution (default: 900)
         """
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self.base_url = base_url or os.environ.get("ANTHROPIC_BASE_URL")
@@ -49,6 +49,10 @@ class ClaudeConfig:
 
         if self.base_url:
             env["ANTHROPIC_BASE_URL"] = self.base_url
+
+        # Remove Claude Code session vars to allow nested CLI invocations
+        for key in ["CLAUDECODE", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_ENTRYPOINT"]:
+            env.pop(key, None)
 
         return env
 

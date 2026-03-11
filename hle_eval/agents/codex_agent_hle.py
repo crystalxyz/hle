@@ -1,7 +1,7 @@
 """
-Claude Code CLI agent for HLE evaluation, based on LAB-Bench codex_agent.py patterns.
+Codex CLI agent for HLE evaluation, based on LAB-Bench codex_agent.py patterns.
 
-This script uses the actual `claude` CLI command to evaluate HLE questions,
+This script uses the actual `codex exec` CLI command to evaluate HLE questions,
 with clean workspace logging and answer parsing.
 """
 import os
@@ -10,43 +10,75 @@ import json
 import shlex
 import asyncio
 import argparse
-import random
 from pathlib import Path
 from datetime import datetime
 from typing import Any
-from collections import defaultdict
 
 from datasets import load_dataset
 from tqdm.asyncio import tqdm_asyncio
 
-from claude_config import ClaudeConfig
+from codex_config import CodexConfig
 
 
-class ClaudeHLEAgent:
-    """Claude Code agent that uses CLI execution for HLE evaluation."""
+class CodexHLEAgent:
+    """Codex agent that uses CLI execution for HLE evaluation."""
 
     def __init__(
         self,
-        config: ClaudeConfig,
+        config: CodexConfig,
         workspace_root: Path,
     ):
         """
-        Initialize Claude HLE agent.
+        Initialize Codex HLE agent.
 
         Args:
-            config: Claude configuration with API credentials
+            config: Codex configuration with API credentials
             workspace_root: Root directory for storing run artifacts
         """
         self.config = config
         self.workspace_root = workspace_root
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
-    def _build_prompt(self, question: dict[str, Any]) -> str:
+    def _get_image_extension(self, data_url: str) -> str:
+        """
+        Extract image extension from data URL header.
+
+        Args:
+            data_url: Data URL string (e.g., "data:image/jpeg;base64,...")
+
+        Returns:
+            File extension (e.g., ".jpg", ".png", ".gif", ".webp")
+        """
+        if not data_url.startswith("data:"):
+            return ".png"  # Default fallback
+
+        # Extract MIME type from data URL header
+        header = data_url.split(",", 1)[0]
+
+        # Map MIME types to extensions
+        mime_to_ext = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "image/svg+xml": ".svg",
+        }
+
+        for mime, ext in mime_to_ext.items():
+            if mime in header:
+                return ext
+
+        return ".png"  # Default fallback
+
+    def _build_prompt(self, question: dict[str, Any], image_filename: str | None = None) -> str:
         """
         Build the prompt for a question.
 
         Args:
             question: Question dict with 'id', 'question', 'image', etc.
+            image_filename: Optional image filename to reference in prompt
 
         Returns:
             Formatted prompt string
@@ -65,35 +97,39 @@ Question:
 """
 
         # Add image reference if present
-        if question.get('image'):
-            prompt += f"\nImage: See the image file at `image.png`\n"
+        if question.get('image') and image_filename:
+            prompt += f"\nImage: See the image file at `{image_filename}`\n"
 
         return prompt
 
     def _build_cli_command(
         self,
+        prompt: str,
         workspace: Path,
     ) -> list[str]:
         """
-        Build claude CLI command following LAB-Bench pattern.
+        Build codex CLI command following LAB-Bench pattern.
 
         Args:
+            prompt: The prompt text to send to codex
             workspace: Workspace directory path
 
         Returns:
             Command list for subprocess execution
         """
-        # Claude Code command that reads prompt.txt and executes
-        prompt_instruction = "Read the file `prompt.txt` and follow the instructions to answer the question. If there is an image file, make sure to view it first."
-
         return [
-            "claude",
-            "-p", prompt_instruction,
-            "--print",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--model", self.config.model,
-            "--dangerously-skip-permissions",
+            "codex",
+            "exec",
+            "-m",
+            self.config.model,
+            "-s",
+            "workspace-write",
+            "--json",
+            "--color",
+            "never",
+            "--skip-git-repo-check",
+            "--",
+            prompt,
         ]
 
     def _parse_answer_file(self, answer_file: Path) -> dict[str, str] | None:
@@ -150,7 +186,7 @@ Question:
         semaphore: asyncio.Semaphore,
     ) -> dict[str, Any]:
         """
-        Run a single question through claude CLI.
+        Run a single question through codex CLI.
 
         Args:
             question: Question dict from HLE dataset
@@ -167,24 +203,28 @@ Question:
             workspace.mkdir(parents=True, exist_ok=True)
 
             # Save image if present
+            image_filename = None
             if question.get("image"):
-                image_path = workspace / "image.png"
                 # HLE images are base64 encoded data URLs
                 if question["image"].startswith("data:"):
                     import base64
+                    # Get correct file extension based on image format
+                    extension = self._get_image_extension(question["image"])
+                    image_filename = f"image{extension}"
+                    image_path = workspace / image_filename
                     # Extract base64 data
                     header, encoded = question["image"].split(",", 1)
                     image_data = base64.b64decode(encoded)
                     image_path.write_bytes(image_data)
 
-            # Build prompt and save it
-            prompt = self._build_prompt(question)
+            # Build prompt with correct image filename and save it
+            prompt = self._build_prompt(question, image_filename)
             prompt_file = workspace / "prompt.txt"
             prompt_file.write_text(prompt, encoding="utf-8")
 
             # Build and execute CLI command
-            cmd = self._build_cli_command(workspace)
-            trajectory_file = workspace / "claude_trajectory.jsonl"
+            cmd = self._build_cli_command(prompt, workspace)
+            trajectory_file = workspace / "codex_trajectory.json"
 
             # Execute with timeout
             try:
@@ -194,7 +234,7 @@ Question:
                 # Use shell command with tee for streaming output capture
                 cmd_str = " ".join(shlex.quote(c) for c in cmd)
                 # Use just the filename since we cd into the workspace
-                shell_cmd = f"cd {shlex.quote(str(workspace))} && {cmd_str} 2>&1 | tee claude_trajectory.jsonl"
+                shell_cmd = f"cd {shlex.quote(str(workspace))} && {cmd_str} 2>&1 | tee codex_trajectory.json"
 
                 process = await asyncio.create_subprocess_shell(
                     shell_cmd,
@@ -280,46 +320,10 @@ Question:
         return results
 
 
-def stratified_sample(questions: list[dict[str, Any]], sample_rate: float, seed: int = 42) -> list[dict[str, Any]]:
-    """
-    Sample from each category at the given rate using specified seed.
-
-    Args:
-        questions: List of question dicts from HLE dataset
-        sample_rate: Sample rate (0.0-1.0) to apply to each category
-        seed: Random seed for reproducibility (default: 42)
-
-    Returns:
-        Sampled list of questions
-    """
-    random.seed(seed)
-
-    # Group questions by category
-    category_questions: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for question in questions:
-        category = question.get("category", "unknown")
-        category_questions[category].append(question)
-
-    # Sample from each category
-    sampled_questions: list[dict[str, Any]] = []
-    print(f"\n=== Stratified Sampling (rate={sample_rate}, seed={seed}) ===")
-    for category in sorted(category_questions.keys()):
-        questions_in_category = category_questions[category]
-        n_samples = max(1, round(len(questions_in_category) * sample_rate))
-        sampled = random.sample(questions_in_category, min(n_samples, len(questions_in_category)))
-        sampled_questions.extend(sampled)
-        print(f"  Category '{category}': {len(sampled)}/{len(questions_in_category)} questions sampled")
-
-    print(f"  Total: {len(sampled_questions)} questions sampled from {len(questions)}")
-    print("=" * 60 + "\n")
-
-    return sampled_questions
-
-
 def main(args):
     """Main execution function."""
     # Create config
-    config = ClaudeConfig(
+    config = CodexConfig(
         model=args.model,
         timeout=args.timeout,
     )
@@ -333,25 +337,21 @@ def main(args):
     # Convert to list of dicts
     questions = [dict(zip(dataset.keys(), values)) for values in zip(*dataset.values())]
 
-    # Apply stratified sampling if sample_rate is specified
-    if args.sample_rate is not None:
-        questions = stratified_sample(questions, args.sample_rate, seed=args.sample_seed)
-
-    # Limit samples if specified (after sampling)
+    # Limit samples if specified
     if args.max_samples:
         questions = questions[:args.max_samples]
 
-    print(f"Total questions to run: {len(questions)}")
+    print(f"Total questions: {len(questions)}")
 
     # Create workspace directory with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    workspace_name = f"claude-code_{args.model}_{timestamp}"
+    workspace_name = f"codex_{args.model.replace('/', '_')}_{timestamp}"
     workspace_root = Path(args.output_dir) / workspace_name
 
     print(f"Workspace: {workspace_root}")
 
     # Create agent
-    agent = ClaudeHLEAgent(
+    agent = CodexHLEAgent(
         config=config,
         workspace_root=workspace_root,
     )
@@ -392,7 +392,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run Claude Code CLI agent on HLE evaluation (LAB-Bench style)"
+        description="Run Codex CLI agent on HLE evaluation (LAB-Bench style)"
     )
     parser.add_argument(
         "--dataset",
@@ -403,8 +403,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        default="sonnet",
-        help="Model name for claude CLI (sonnet, opus, haiku)",
+        default="gpt-4o",
+        help="Model name for codex exec",
     )
     parser.add_argument(
         "--timeout",
@@ -419,22 +419,10 @@ if __name__ == "__main__":
         help="Number of concurrent workers (default: 4)",
     )
     parser.add_argument(
-        "--sample_rate",
-        type=float,
-        default=None,
-        help="Sample rate (0.0-1.0) for stratified sampling by category (default: None = no sampling)",
-    )
-    parser.add_argument(
-        "--sample_seed",
-        type=int,
-        default=42,
-        help="Random seed for stratified sampling (default: 42)",
-    )
-    parser.add_argument(
         "--max_samples",
         type=int,
         default=None,
-        help="Limit evaluation to first N samples (applied after sampling, for testing)",
+        help="Limit evaluation to first N samples (for testing)",
     )
     parser.add_argument(
         "--output_dir",
@@ -444,9 +432,4 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    # Validate sample_rate range
-    if args.sample_rate is not None and not (0.0 <= args.sample_rate <= 1.0):
-        parser.error("--sample_rate must be between 0.0 and 1.0")
-
     main(args)
