@@ -84,7 +84,7 @@ fi
 claude --verbose --output-format=stream-json \\
     --permission-mode bypassPermissions \\
     --print \\
-    -- "Task instructions are in /app/instruction.md\\nRead that file for the complete task description." \\
+    -- "# Task instructions are in /app/instruction.md\\nRead that file for the complete task description." \\
     2>&1 </dev/null | tee /logs/agent/claude-code.txt"""
 
 ENTRYPOINT_TEMPLATE = build_entrypoint(_CLAUDE_AGENT_COMMAND)
@@ -496,8 +496,15 @@ class ClaudeHLEAgent:
             raise RuntimeError("Cannot find command ID.")
 
         # Poll for completion (1s interval matches Harbor)
+        poll_timeout = (timeout or 1200) + 60  # allow some buffer beyond command timeout
+        poll_start = asyncio.get_event_loop().time()
         cmd = await sandbox.process.get_session_command(session_id, response.cmd_id)
         while cmd.exit_code is None:
+            elapsed = asyncio.get_event_loop().time() - poll_start
+            if elapsed > poll_timeout:
+                raise asyncio.TimeoutError(
+                    f"Daytona command polling timed out after {int(elapsed)}s"
+                )
             await asyncio.sleep(1)
             cmd = await sandbox.process.get_session_command(session_id, response.cmd_id)
 
@@ -587,7 +594,7 @@ class ClaudeHLEAgent:
                 '--permission-mode bypassPermissions '
                 f'{max_turns_flag}'
                 '--print '
-                '-- "Task instructions are in /app/instruction.md\n'
+                '-- "# Task instructions are in /app/instruction.md\n'
                 'Read that file for the complete task description." '
                 '2>&1 </dev/null | tee /logs/agent/claude-code.txt'
             )
@@ -730,10 +737,14 @@ def main(args):
     dataset = load_dataset(args.dataset, split="test").to_dict()
     questions = [dict(zip(dataset.keys(), values)) for values in zip(*dataset.values())]
 
-    if args.task_ids:
-        task_ids_set = set(args.task_ids)
+    # Collect task IDs from --task_ids and/or --task_ids_file
+    task_ids_set = set(args.task_ids) if args.task_ids else set()
+    if args.task_ids_file:
+        file_ids = json.loads(Path(args.task_ids_file).read_text())
+        task_ids_set.update(file_ids)
+    if task_ids_set:
         questions = [q for q in questions if q["id"] in task_ids_set]
-        print(f"Filtered to {len(questions)} questions matching task IDs: {args.task_ids}")
+        print(f"Filtered to {len(questions)} questions matching {len(task_ids_set)} task IDs")
 
     if args.sample_rate is not None:
         questions = stratified_sample(questions, args.sample_rate, seed=args.sample_seed)
@@ -788,6 +799,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout in seconds per question (default: 1200)")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of concurrent workers (default: 4)")
     parser.add_argument("--task_ids", type=str, nargs="+", default=None, help="Specific task IDs to run")
+    parser.add_argument("--task_ids_file", type=str, default=None, help="JSON file containing a list of task IDs to run")
     parser.add_argument("--sample_rate", type=float, default=None, help="Sample rate (0.0-1.0) for stratified sampling")
     parser.add_argument("--sample_seed", type=int, default=42, help="Random seed for stratified sampling (default: 42)")
     parser.add_argument("--max_samples", type=int, default=None, help="Limit to first N samples (applied after sampling)")

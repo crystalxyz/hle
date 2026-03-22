@@ -14,7 +14,7 @@ import numpy as np
 from pathlib import Path
 from typing import Literal
 from pydantic import BaseModel
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, LengthFinishReasonError
 from tqdm.asyncio import tqdm_asyncio
 from datasets import load_dataset
 
@@ -36,6 +36,7 @@ JUDGE_PROMPT = """Judge whether the following [response] to [question] is correc
 
 Your judgement must be in the format and criteria specified below:
 
+extracted_final_answer: The final exact answer extracted from the [response]. Put the extracted answer as 'None' if there is no exact, final answer to extract from the response.
 
 [correct_answer]: {correct_answer}
 
@@ -44,7 +45,7 @@ reasoning: Explain why the extracted_final_answer is correct or incorrect based 
 correct: Answer 'yes' if extracted_final_answer matches the [correct_answer] given above, or is within a small margin of error for numerical problems. Answer 'no' otherwise, i.e. if there if there is any inconsistency, ambiguity, non-equivalency, or if the extracted answer is incorrect.
 
 
-confidence: The extracted confidence score between 0|\%| and 100|\%| from [response]. Put 100 if there is no confidence score available."""
+confidence: The extracted confidence score between 0% and 100% from [response]. Put 100 if there is no confidence score available."""
 
 
 class ExtractedAnswer(BaseModel):
@@ -73,7 +74,7 @@ async def extract_answer_with_retry(
         try:
             api_response = await client.beta.chat.completions.parse(
                 model=judge_model,
-                max_completion_tokens=4096,
+                max_completion_tokens=16384,
                 messages=[{"role": "user", "content": prompt}],
                 response_format=ExtractedAnswer,
             )
@@ -86,11 +87,15 @@ async def extract_answer_with_retry(
                 "confidence": content.confidence,
             }
 
+        except LengthFinishReasonError:
+            print(f"[FAIL] Question '{question[:80]}...' exceeded max tokens, skipping.")
+            return None
         except Exception as e:
-            if attempt == max_retries - 1:
-                print(f"Error after {max_retries} retries: {e}")
-                return None
             wait_time = min(2 ** attempt, 16)
+            if attempt == max_retries - 1:
+                print(f"[FAIL] Question '{question[:80]}...' gave up after {max_retries} retries. Last error: {e}")
+                return None
+            print(f"[RETRY {attempt+1}/{max_retries}] Question '{question[:80]}...' error: {type(e).__name__}: {e}. Waiting {wait_time}s...")
             await asyncio.sleep(wait_time)
 
     return None
@@ -271,7 +276,7 @@ def build_report(
     confidence_arr = np.array(
         [e["confidence"] for e in passed] + [e["confidence"] for e in failed]
     ) / 100
-    cal_err = round(100 * calib_err(confidence_arr, correct_arr, p='2', beta=100), 2) if len(correct_arr) > 0 else 0.0
+    cal_err = round(100 * calib_err(confidence_arr, correct_arr, p='2', beta=10), 2) if len(correct_arr) > 0 else 0.0
 
     # Category breakdown
     cat_counts: dict[str, dict[str, int]] = {}
@@ -311,7 +316,7 @@ def load_results_from_workspace(workspace_path: str) -> dict:
 
 def main(args):
     num_workers = args.num_workers
-    max_retries = 20
+    max_retries = 5
 
     # Load results
     if args.workspace:
@@ -326,7 +331,7 @@ def main(args):
     else:
         raise ValueError("Must provide either --workspace or --predictions")
 
-    client = AsyncOpenAI(timeout=300.0, max_retries=0)
+    client = AsyncOpenAI(timeout=60.0, max_retries=0)
 
     print(f"Judge model: {args.judge}")
 
