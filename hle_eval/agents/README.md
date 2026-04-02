@@ -7,8 +7,7 @@ Agent implementations for running [Humanity's Last Exam (HLE)](https://huggingfa
 | Agent | File | Description |
 |-------|------|-------------|
 | Claude Code | `claude_agent_hle.py` | Claude Code CLI agent. Supports local, Docker, and Daytona execution. |
-| OpenHands | `openhands_agent_hle.py` | OpenHands (CodeAct) agent. Supports local and Docker execution. |
-| Codex | `codex_agent_hle.py` | OpenAI Codex CLI agent. |
+| Codex | `codex_agent_hle.py` | OpenAI Codex CLI agent. Supports local and Docker execution. |
 
 ## Shared Modules
 
@@ -16,8 +15,20 @@ Agent implementations for running [Humanity's Last Exam (HLE)](https://huggingfa
 |------|-------------|
 | `hle_common.py` | Shared utilities: prompt building, image handling, answer parsing, Docker lifecycle, dataset sampling. |
 | `claude_config.py` | Claude Code configuration (API key, model, base URL, timeout). |
-| `openhands_config.py` | OpenHands configuration. |
 | `judge_agent_results.py` | LLM judge for evaluating agent responses (default: gpt-5). |
+
+## Parity Results
+
+The parity subset (249 tasks) is drawn by randomly selecting 10% of each category with random seed 42. All experiments use gpt-5 as the LLM judge.
+
+| Agent              | Model            | Metric                | Trials | Dataset Size          | Original Benchmark | Harbor Adapter |
+| ------------------ | ---------------- | --------------------- | ------ | --------------------- | ------------------ | -------------- |
+| claude-code@2.1.76 | claude-haiku-4-5 | Accuracy (%)          | 3      | 249 (10% of full set) | 10.71% ± 0.94%     | 10.98% ± 0.36% |
+| claude-code@2.1.76 | claude-haiku-4-5 | Calibration error (%) | 3      | 249 (10% of full set) | 55.22% ± 0.59%     | 52.69% ± 0.67% |
+
+- Uncertainties are sampling standard error of the mean.
+- Calibration error uses ECE with beta=10 (binned L2-norm).
+- Full results: see `adapters/hle/parity_experiment.json` in the Harbor adapter directory.
 
 ## Reproduction step
 
@@ -34,13 +45,11 @@ python agents/claude_agent_hle.py --model claude-haiku-4-5 -e docker --max_sampl
 DAYTONA_API_KEY=... python claude_agent_hle.py --model claude-haiku-4-5 -e daytona --sample_rate 0.1 --num_workers 10 --max_samples 10
 ```
 
-```
-
 ### Judging Results
 
 ```bash
 # Judge a workspace
-python agents/judge_agent_results.py --workspace ../jobs/claude-code_claude-haiku-4-5_20260309_123456
+python agents/judge_agent_results.py --workspace ../jobs/claude-code_claude-haiku-4-5_xxx
 
 # Judge a predictions file
 python agents/judge_agent_results.py --predictions ../jobs/results.json --judge gpt-5
@@ -50,24 +59,24 @@ python agents/judge_agent_results.py --predictions ../jobs/results.json --judge 
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | Anthropic API key |
+| `ANTHROPIC_API_KEY` | Claude only | Anthropic API key |
 | `ANTHROPIC_BASE_URL` | No | Custom API base URL (e.g., proxy) |
+| `OPENAI_API_KEY` | Codex/Judge | OpenAI API key |
 | `DAYTONA_API_KEY` | Daytona only | Daytona API key |
-| `OPENAI_API_KEY` | Judge only | OpenAI API key for LLM judge |
-| `MAX_THINKING_TOKENS` | No | Limit thinking tokens for Claude |
-| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | No | Limit output tokens |
-| `CLAUDE_CODE_MAX_TURNS` | No | Limit agent turns |
 
 ## Common Options
 
 ```
---model MODEL          Model name (default: sonnet)
+--model MODEL          Model name
 --timeout TIMEOUT      Timeout per question in seconds (default: 1200)
 --num_workers N        Concurrent workers (default: 4)
 --task_ids ID [ID ...] Run specific task IDs only
+--task_ids_file FILE   JSON file with task IDs to run
 --sample_rate RATE     Stratified sampling rate (0.0-1.0)
+--sample_seed SEED     Random seed for sampling (default: 42)
 --max_samples N        Limit total samples
 --output_dir DIR       Output directory (default: ../jobs)
+-e, --environment      Execution environment (local, docker, daytona)
 ```
 
 ## Output Structure

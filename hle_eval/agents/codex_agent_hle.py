@@ -1,11 +1,11 @@
 """
-Codex CLI agent for HLE evaluation, based on LAB-Bench codex_agent.py patterns.
+Codex CLI agent for HLE evaluation.
 
-This script uses the actual `codex exec` CLI command to evaluate HLE questions,
-with clean workspace logging and answer parsing.
+Supports local and Docker execution (-e/--environment flag).
+Uses shared utilities from hle_common for prompt building, image handling,
+answer parsing, and Docker lifecycle management.
 """
 import os
-import re
 import json
 import shlex
 import asyncio
@@ -18,366 +18,382 @@ from datasets import load_dataset
 from tqdm.asyncio import tqdm_asyncio
 
 from codex_config import CodexConfig
+from hle_common import (
+    build_entrypoint,
+    build_hle_prompt,
+    create_docker_build_context,
+    decode_and_save_image,
+    docker_build_task_image,
+    docker_cleanup_task_image,
+    docker_verify,
+    find_docker_response,
+    parse_answer_file,
+    save_docker_outputs,
+    stratified_sample,
+)
 
+
+# ── Docker templates (Codex specific) ─────────────────────────────────
+
+DOCKERFILE_TEMPLATE = """\
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y bash coreutils && rm -rf /var/lib/apt/lists/*
+
+# Install packages required by the LLM judge (test_judge.py)
+RUN pip install --no-cache-dir openai>=1.59.0 anthropic>=0.40.0 pydantic>=2.10.0
+
+WORKDIR /app
+
+RUN mkdir -p /logs/agent /logs/verifier
+
+# Copy workspace contents (includes images if present) to /app
+COPY workspace/ ./
+
+# Copy and setup entrypoint script
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+"""
+
+# Agent-specific command block for the entrypoint
+_CODEX_AGENT_COMMAND = """\
+# Run Codex CLI agent
+codex exec \\
+    -m "$CODEX_MODEL" \\
+    -s workspace-write \\
+    --json \\
+    --color never \\
+    --skip-git-repo-check \\
+    -- "$(cat /app/instruction.md)" \\
+    2>&1 | tee /logs/agent/codex.txt"""
+
+ENTRYPOINT_TEMPLATE = build_entrypoint(_CODEX_AGENT_COMMAND)
+
+
+# ── Agent class ─────────────────────────────────────────────────────────
 
 class CodexHLEAgent:
-    """Codex agent that uses CLI execution for HLE evaluation."""
+    """Codex agent for HLE evaluation (local or Docker)."""
 
     def __init__(
         self,
         config: CodexConfig,
         workspace_root: Path,
+        environment: str = "local",
     ):
-        """
-        Initialize Codex HLE agent.
-
-        Args:
-            config: Codex configuration with API credentials
-            workspace_root: Root directory for storing run artifacts
-        """
         self.config = config
         self.workspace_root = workspace_root
+        self.environment = environment
         self.workspace_root.mkdir(parents=True, exist_ok=True)
 
-    def _get_image_extension(self, data_url: str) -> str:
-        """
-        Extract image extension from data URL header.
-
-        Args:
-            data_url: Data URL string (e.g., "data:image/jpeg;base64,...")
-
-        Returns:
-            File extension (e.g., ".jpg", ".png", ".gif", ".webp")
-        """
-        if not data_url.startswith("data:"):
-            return ".png"  # Default fallback
-
-        # Extract MIME type from data URL header
-        header = data_url.split(",", 1)[0]
-
-        # Map MIME types to extensions
-        mime_to_ext = {
-            "image/jpeg": ".jpg",
-            "image/jpg": ".jpg",
-            "image/png": ".png",
-            "image/gif": ".gif",
-            "image/webp": ".webp",
-            "image/bmp": ".bmp",
-            "image/svg+xml": ".svg",
-        }
-
-        for mime, ext in mime_to_ext.items():
-            if mime in header:
-                return ext
-
-        return ".png"  # Default fallback
-
-    def _build_prompt(self, question: dict[str, Any], image_filename: str | None = None) -> str:
-        """
-        Build the prompt for a question.
-
-        Args:
-            question: Question dict with 'id', 'question', 'image', etc.
-            image_filename: Optional image filename to reference in prompt
-
-        Returns:
-            Formatted prompt string
-        """
-        prompt = f"""You are answering a challenging academic question from Humanity's Last Exam.
-
-Instruction:
-- Provide your response in the following format:
-  Explanation: {{your explanation for your answer choice}}
-  Answer: {{your chosen answer}}
-  Confidence: {{your confidence score between 0% and 100% for your answer}}
-- Write your response to `answer.txt`.
-
-Question:
-{question['question']}
-"""
-
-        # Add image reference if present
-        if question.get('image') and image_filename:
-            prompt += f"\nImage: See the image file at `{image_filename}`\n"
-
-        return prompt
-
-    def _build_cli_command(
+    def _build_prompt(
         self,
-        prompt: str,
+        question: dict[str, Any],
         workspace: Path,
-    ) -> list[str]:
-        """
-        Build codex CLI command following LAB-Bench pattern.
+        image_filename: str | None = None,
+    ) -> str:
+        if self.environment == "docker":
+            response_path = "/logs/agent/response.txt"
+            image_path = f"/app/{image_filename}" if image_filename else None
+        else:
+            response_path = str(workspace / "response.txt")
+            image_path = str(workspace / image_filename) if image_filename else None
+        return build_hle_prompt(question, response_path, image_path)
 
-        Args:
-            prompt: The prompt text to send to codex
-            workspace: Workspace directory path
+    def _docker_prompt(
+        self,
+        question: dict[str, Any],
+        image_filename: str | None = None,
+    ) -> str:
+        response_path = "/logs/agent/response.txt"
+        image_path = f"/app/{image_filename}" if image_filename else None
+        return build_hle_prompt(question, response_path, image_path)
 
-        Returns:
-            Command list for subprocess execution
-        """
-        return [
+    def _build_sandbox_env(self) -> dict[str, str]:
+        """Build env var dict for Docker sandboxes."""
+        env_vars = {}
+        if self.config.api_key:
+            env_vars["OPENAI_API_KEY"] = self.config.api_key
+        if self.config.base_url:
+            env_vars["OPENAI_BASE_URL"] = self.config.base_url
+        env_vars["CODEX_MODEL"] = self.config.model
+        return env_vars
+
+    # ── Local execution ─────────────────────────────────────────────────
+
+    async def _run_question_local(
+        self,
+        question: dict[str, Any],
+        workspace: Path,
+    ) -> dict[str, Any]:
+        question_id = question["id"]
+
+        image_filename = decode_and_save_image(question, workspace)
+        prompt = self._build_prompt(question, workspace, image_filename)
+
+        cmd = [
             "codex",
             "exec",
-            "-m",
-            self.config.model,
-            "-s",
-            "workspace-write",
+            "-m", self.config.model,
+            "-s", "workspace-write",
             "--json",
-            "--color",
-            "never",
+            "--color", "never",
             "--skip-git-repo-check",
             "--",
             prompt,
         ]
 
-    def _parse_answer_file(self, answer_file: Path) -> dict[str, str] | None:
-        """
-        Parse the answer.txt file for Explanation, Answer, and Confidence.
+        try:
+            env = self.config.get_env_dict()
 
-        Args:
-            answer_file: Path to answer.txt file
+            cmd_str = " ".join(shlex.quote(c) for c in cmd)
+            shell_cmd = f"cd {shlex.quote(str(workspace))} && {cmd_str} 2>&1 | tee codex_trajectory.json"
 
-        Returns:
-            Dict with 'explanation', 'answer', 'confidence' or None if parsing fails
-        """
-        if not answer_file.exists():
-            return None
+            process = await asyncio.create_subprocess_shell(
+                shell_cmd,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
 
-        content = answer_file.read_text(encoding="utf-8")
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.config.timeout,
+            )
 
-        # Try to extract structured response
-        explanation_match = re.search(
-            r"Explanation:\s*(.+?)(?=Answer:|Confidence:|$)",
-            content,
-            re.DOTALL | re.IGNORECASE,
-        )
-        answer_match = re.search(
-            r"Answer:\s*(.+?)(?=Confidence:|$)",
-            content,
-            re.DOTALL | re.IGNORECASE,
-        )
-        confidence_match = re.search(
-            r"Confidence:\s*(.+?)(?=$)",
-            content,
-            re.DOTALL | re.IGNORECASE,
-        )
-
-        if answer_match:
-            return {
-                "explanation": explanation_match.group(1).strip() if explanation_match else "",
-                "answer": answer_match.group(1).strip(),
-                "confidence": confidence_match.group(1).strip() if confidence_match else "",
-                "raw": content,
+            metadata = {
+                "question_id": question_id,
+                "returncode": process.returncode,
+                "timeout": False,
+                "error": stderr.decode("utf-8") if stderr else None,
             }
 
-        # Fallback: return raw content if structured parsing fails
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            metadata = {
+                "question_id": question_id,
+                "returncode": -1,
+                "timeout": True,
+                "error": f"Execution timed out after {self.config.timeout}s",
+            }
+
+        except Exception as e:
+            metadata = {
+                "question_id": question_id,
+                "returncode": -1,
+                "timeout": False,
+                "error": str(e),
+            }
+
+        parsed_answer = parse_answer_file(workspace / "response.txt")
+
+        (workspace / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+
         return {
-            "explanation": "",
-            "answer": content.strip(),
-            "confidence": "",
-            "raw": content,
+            "question_id": question_id,
+            "response": parsed_answer.get("raw", "") if parsed_answer else None,
+            "parsed": parsed_answer,
+            "metadata": metadata,
+            "workspace": str(workspace),
         }
+
+    # ── Docker execution ────────────────────────────────────────────────
+
+    async def _run_question_docker(
+        self,
+        question: dict[str, Any],
+        workspace: Path,
+    ) -> dict[str, Any]:
+        question_id = question["id"]
+
+        logs_dir = workspace / "logs"
+        logs_dir.mkdir(exist_ok=True)
+
+        task_image = None
+        try:
+            build_ctx, _ = create_docker_build_context(
+                question, workspace,
+                dockerfile=DOCKERFILE_TEMPLATE,
+                entrypoint=ENTRYPOINT_TEMPLATE,
+                build_prompt=self._docker_prompt,
+            )
+            task_image = await docker_build_task_image(
+                question_id, build_ctx, tag_prefix="hle-codex",
+            )
+
+            docker_cmd = [
+                "docker", "run", "--rm",
+                "-v", f"{logs_dir.resolve()}:/logs",
+                "-v", f"{workspace.resolve()}:/app/host_output",
+            ]
+
+            env_vars = self._build_sandbox_env()
+            for key, val in env_vars.items():
+                docker_cmd += ["-e", f"{key}={val}"]
+
+            docker_cmd.append(task_image)
+
+            process = await asyncio.create_subprocess_exec(
+                *docker_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace,
+            )
+
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=self.config.timeout,
+            )
+
+            stdout_text = stdout.decode("utf-8")
+            stderr_text = stderr.decode("utf-8")
+            save_docker_outputs(workspace, stdout_text, stderr_text)
+
+            metadata = {
+                "question_id": question_id,
+                "returncode": process.returncode,
+                "timeout": False,
+                "error": stderr_text if stderr_text else None,
+                "runtime": "docker",
+                "task_image": task_image,
+            }
+
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+            metadata = {
+                "question_id": question_id,
+                "returncode": -1,
+                "timeout": True,
+                "error": f"Execution timed out after {self.config.timeout}s",
+                "runtime": "docker",
+                "task_image": task_image,
+            }
+
+        except Exception as e:
+            metadata = {
+                "question_id": question_id,
+                "returncode": -1,
+                "timeout": False,
+                "error": str(e),
+                "runtime": "docker",
+                "task_image": task_image if task_image else "build_failed",
+            }
+
+        parsed_answer = find_docker_response(logs_dir, workspace)
+
+        (workspace / "metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
+        )
+
+        if task_image:
+            await docker_cleanup_task_image(task_image)
+
+        return {
+            "question_id": question_id,
+            "response": parsed_answer.get("raw", "") if parsed_answer else None,
+            "parsed": parsed_answer,
+            "metadata": metadata,
+            "workspace": str(workspace),
+        }
+
+    # ── Orchestration ───────────────────────────────────────────────────
 
     async def run_question(
         self,
         question: dict[str, Any],
         semaphore: asyncio.Semaphore,
     ) -> dict[str, Any]:
-        """
-        Run a single question through codex CLI.
-
-        Args:
-            question: Question dict from HLE dataset
-            semaphore: Semaphore for concurrency control
-
-        Returns:
-            Result dict with question_id, response, and metadata
-        """
         async with semaphore:
-            question_id = question["id"]
-
-            # Create workspace directory for this question
-            workspace = self.workspace_root / f"run_{question_id}"
+            workspace = self.workspace_root / f"run_{question['id']}"
             workspace.mkdir(parents=True, exist_ok=True)
 
-            # Save image if present
-            image_filename = None
-            if question.get("image"):
-                # HLE images are base64 encoded data URLs
-                if question["image"].startswith("data:"):
-                    import base64
-                    # Get correct file extension based on image format
-                    extension = self._get_image_extension(question["image"])
-                    image_filename = f"image{extension}"
-                    image_path = workspace / image_filename
-                    # Extract base64 data
-                    header, encoded = question["image"].split(",", 1)
-                    image_data = base64.b64decode(encoded)
-                    image_path.write_bytes(image_data)
-
-            # Build prompt with correct image filename and save it
-            prompt = self._build_prompt(question, image_filename)
-            prompt_file = workspace / "prompt.txt"
-            prompt_file.write_text(prompt, encoding="utf-8")
-
-            # Build and execute CLI command
-            cmd = self._build_cli_command(prompt, workspace)
-            trajectory_file = workspace / "codex_trajectory.json"
-
-            # Execute with timeout
-            try:
-                # Change to workspace directory for execution
-                env = self.config.get_env_dict()
-
-                # Use shell command with tee for streaming output capture
-                cmd_str = " ".join(shlex.quote(c) for c in cmd)
-                # Use just the filename since we cd into the workspace
-                shell_cmd = f"cd {shlex.quote(str(workspace))} && {cmd_str} 2>&1 | tee codex_trajectory.json"
-
-                process = await asyncio.create_subprocess_shell(
-                    shell_cmd,
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.config.timeout,
-                )
-
-                returncode = process.returncode
-
-                # Save metadata
-                metadata = {
-                    "question_id": question_id,
-                    "returncode": returncode,
-                    "timeout": False,
-                    "error": stderr.decode("utf-8") if stderr else None,
-                }
-
-            except asyncio.TimeoutError:
-                # Kill the process on timeout
-                try:
-                    process.kill()
-                    await process.wait()
-                except Exception:
-                    pass
-
-                metadata = {
-                    "question_id": question_id,
-                    "returncode": -1,
-                    "timeout": True,
-                    "error": f"Execution timed out after {self.config.timeout}s",
-                }
-
-            except Exception as e:
-                metadata = {
-                    "question_id": question_id,
-                    "returncode": -1,
-                    "timeout": False,
-                    "error": str(e),
-                }
-
-            # Parse answer file
-            answer_file = workspace / "answer.txt"
-            parsed_answer = self._parse_answer_file(answer_file)
-
-            # Save metadata to workspace
-            metadata_file = workspace / "metadata.json"
-            metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-
-            return {
-                "question_id": question_id,
-                "response": parsed_answer.get("raw", "") if parsed_answer else None,
-                "parsed": parsed_answer,
-                "metadata": metadata,
-                "workspace": str(workspace),
-            }
+            if self.environment == "docker":
+                return await self._run_question_docker(question, workspace)
+            return await self._run_question_local(question, workspace)
 
     async def run_all_questions(
         self,
         questions: list[dict[str, Any]],
         num_workers: int = 4,
     ) -> list[dict[str, Any]]:
-        """
-        Run all questions with concurrent execution.
+        if self.environment == "docker":
+            if not await docker_verify():
+                raise RuntimeError("Docker daemon is not running")
 
-        Args:
-            questions: List of question dicts from HLE dataset
-            num_workers: Number of concurrent workers (default: 4)
-
-        Returns:
-            List of result dicts
-        """
         semaphore = asyncio.Semaphore(num_workers)
-
         tasks = [self.run_question(q, semaphore) for q in questions]
-        results = await tqdm_asyncio.gather(*tasks, desc="Running questions")
+        desc = f"Running questions ({self.environment})"
+        return await tqdm_asyncio.gather(*tasks, desc=desc)
 
-        return results
 
+# ── CLI entrypoint ──────────────────────────────────────────────────────
 
 def main(args):
-    """Main execution function."""
-    # Create config
-    config = CodexConfig(
-        model=args.model,
-        timeout=args.timeout,
-    )
+    config = CodexConfig(model=args.model, timeout=args.timeout)
 
     print(f"Configuration: {config}")
+    print(f"Environment: {args.environment}")
 
-    # Load dataset
     print(f"Loading dataset: {args.dataset}")
     dataset = load_dataset(args.dataset, split="test").to_dict()
-
-    # Convert to list of dicts
     questions = [dict(zip(dataset.keys(), values)) for values in zip(*dataset.values())]
 
-    # Limit samples if specified
+    # Collect task IDs from --task_ids and/or --task_ids_file
+    task_ids_set = set(args.task_ids) if args.task_ids else set()
+    if args.task_ids_file:
+        file_ids = json.loads(Path(args.task_ids_file).read_text())
+        task_ids_set.update(file_ids)
+    if task_ids_set:
+        questions = [q for q in questions if q["id"] in task_ids_set]
+        print(f"Filtered to {len(questions)} questions matching {len(task_ids_set)} task IDs")
+
+    if args.sample_rate is not None:
+        questions = stratified_sample(questions, args.sample_rate, seed=args.sample_seed)
+
     if args.max_samples:
         questions = questions[:args.max_samples]
 
-    print(f"Total questions: {len(questions)}")
+    print(f"Total questions to run: {len(questions)}")
 
-    # Create workspace directory with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    workspace_name = f"codex_{args.model.replace('/', '_')}_{timestamp}"
-    workspace_root = Path(args.output_dir) / workspace_name
-
+    env_label = {"local": "codex", "docker": "codex-docker"}
+    prefix = env_label.get(args.environment, f"codex-{args.environment}")
+    workspace_name = f"{prefix}_{args.model}_{timestamp}"
+    workspace_root = (Path(args.output_dir) / workspace_name).resolve()
     print(f"Workspace: {workspace_root}")
 
-    # Create agent
     agent = CodexHLEAgent(
         config=config,
         workspace_root=workspace_root,
+        environment=args.environment,
     )
-
-    # Run evaluation
     results = asyncio.run(agent.run_all_questions(questions, num_workers=args.num_workers))
 
-    # Save aggregated results
     output_file = workspace_root / "results.json"
     predictions = {}
-
     for result in results:
-        question_id = result["question_id"]
-        predictions[question_id] = {
+        predictions[result["question_id"]] = {
             "model": args.model,
             "response": result["response"],
             "parsed": result["parsed"],
             "metadata": result["metadata"],
             "workspace": result["workspace"],
         }
-
     output_file.write_text(json.dumps(predictions, indent=2), encoding="utf-8")
-
     print(f"\nResults saved to: {output_file}")
 
-    # Print summary statistics
     total = len(results)
     successful = sum(1 for r in results if r["response"] is not None)
     timed_out = sum(1 for r in results if r["metadata"]["timeout"])
@@ -392,44 +408,26 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run Codex CLI agent on HLE evaluation (LAB-Bench style)"
+        description="Run Codex CLI agent on HLE evaluation"
     )
+    parser.add_argument("--dataset", type=str, default="cais/hle", help="HLE HuggingFace dataset name")
+    parser.add_argument("--model", type=str, default="gpt-4o", help="Model name for codex exec")
+    parser.add_argument("--timeout", type=float, default=1200.0, help="Timeout in seconds per question (default: 1200)")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of concurrent workers (default: 4)")
+    parser.add_argument("--task_ids", type=str, nargs="+", default=None, help="Specific task IDs to run")
+    parser.add_argument("--task_ids_file", type=str, default=None, help="JSON file containing a list of task IDs to run")
+    parser.add_argument("--sample_rate", type=float, default=None, help="Sample rate (0.0-1.0) for stratified sampling")
+    parser.add_argument("--sample_seed", type=int, default=42, help="Random seed for stratified sampling (default: 42)")
+    parser.add_argument("--max_samples", type=int, default=None, help="Limit to first N samples (applied after sampling)")
+    parser.add_argument("--output_dir", type=str, default="../jobs", help="Output directory (default: ../jobs)")
     parser.add_argument(
-        "--dataset",
-        type=str,
-        default="cais/hle",
-        help="HLE HuggingFace dataset name",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="gpt-4o",
-        help="Model name for codex exec",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=600.0,
-        help="Timeout in seconds for each question (default: 600)",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=4,
-        help="Number of concurrent workers (default: 4)",
-    )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=None,
-        help="Limit evaluation to first N samples (for testing)",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="../jobs",
-        help="Output directory for results (default: ../jobs)",
+        "-e", "--environment",
+        choices=["local", "docker"],
+        default="local",
+        help="Execution environment: local (default) or docker",
     )
 
     args = parser.parse_args()
+    if args.sample_rate is not None and not (0.0 <= args.sample_rate <= 1.0):
+        parser.error("--sample_rate must be between 0.0 and 1.0")
     main(args)
